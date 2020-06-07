@@ -1,139 +1,121 @@
 import pickle
 import socket
+import signal
+import sys
+from select import select
 from datetime import timedelta, datetime
+
 from dnslib import DNSError, DNSRecord
 
-forward_server = "ns1.e1.ru"
+forward_server = "8.8.8.8"
+
+CACHE_FILE_NAME = "dnscache.pickle"
 
 
-class Packet:
-    def __init__(self, rr, create_time):
-        self.resource_record = rr
+# Класс для хранения записей в кэше
+class Record:
+    def __init__(self, resource_record, create_time):
+        self.resource_record = resource_record
         self.create_time = create_time
 
 
-def load_cache():
+# Загрузка кэша из файла
+def load_cache_from_disk(filename):
+    cache = {}
     try:
-        with open('data.pickle', 'rb') as f:
-            database = pickle.load(f)
-        print('history cache')
+        with open(filename, "rb") as file:
+            cache = pickle.load(file)
+            print("Cache loaded successfully")
     except:
-        print('cache not exist')
-        return {}
-    return database
+        print("Cache not found")
+    return cache
 
 
-def save_cache(data):
+# Сохранения кэша в файл
+def save_cache_to_disk(cache, filename):
     try:
-        with open('data.pickle', 'wb') as f:
-            pickle.dump(data, f)
-        print('save cache done')
-    except:
-        print('save cache error')
+        with open(filename, "wb") as file:
+            print("Saving cache...")
+            pickle.dump(cache, file)
+            print("Cache saved successfully")
+    except BaseException:
+        print("Cache saving error")
 
 
-def check_cache(packet):
-    return datetime.now() - packet.create_time > timedelta(seconds=packet.resource_record.ttl)
+# Удаление старых записей
+def clear_old_cache(cache):
+    for key in list(cache.keys()):
+        record = cache[key]
+        if datetime.now() - record.create_time > timedelta(seconds=record.resource_record.ttl):
+            print("Deleting old cache record:", record.resource_record)
+            del cache[key]
 
 
-def clear_old_cash():
-    cache_delta = 0
-    for key, value in database.items():
-        old_length = len(value)
-        database[key] = set(packet for packet in value if not check_cache(packet))
-        cache_delta += old_length - len(database[key])
-    if cache_delta > 0:
-        print(str(datetime.now()) + " - cleared " + str(cache_delta) + " resource records")
-
-
-def add_record(rr, date_time):
+# Кэширование записи
+def cache_record(rr, date_time, cache):
     k = (str(rr.rname).lower(), rr.rtype)
-    if k in database:
-        database[k].add(Packet(rr, date_time))
-    else:
-        database[k] = {Packet(rr, date_time)}
+    cache[k] = Record(rr, date_time)
 
 
-def add_records(dns_record):
-    for r in dns_record.rr + dns_record.auth + dns_record.ar:
-        print(r)
+# Кеширование записей
+def cache_records(dns_record, cache):
+    for record in dns_record.rr + dns_record.auth + dns_record.ar:
+        print(record)
         date_time = datetime.now()
-        add_record(r, date_time)
+        cache_record(record, date_time, cache)
 
 
-def get_response_from_cache(dns_record):
-    print("get cache answer")
+# Поиск записи в кэше
+def find_record_in_cache(dns_record, cache):
     key = (str(dns_record.q.qname).lower(), dns_record.q.qtype)
-    if key in database and database[key]:
+    if key in cache:
+        print("Record founded in cache")
         reply = dns_record.reply()
-        reply.rr = [p.resource_record for p in database[key]]
+        reply.rr = [cache[key].resource_record]
         return reply
 
 
-def send_response(response, addr):
-    sock.connect(addr)
-    sock.sendall(response)
-    sock.close()
-
-
-def work_loop():
-    global sock
-
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.bind(("", 53))
-
-    try:
-        while True:
-            data, addr = sock.recvfrom(2048)
-
-            if database:
-                clear_old_cash()
-
-            try:
-                dns_record = DNSRecord.parse(data)
-                # print(dns_record)
-            except DNSError:
-                print('error parse')
-                continue
-
-            add_records(dns_record)
-            if not dns_record.header.qr:
-                response = get_response_from_cache(dns_record)
-                try:
-                    if response:
-                        print(response)
-                        send_response(response.pack(), addr)
-                        if database:
-                            save_cache(database)
-                    else:
-                        resp = dns_record.send(forward_server)
-                        add_records(DNSRecord.parse(resp))
-                        send_response(resp, addr)
-                    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                    sock.bind(("", 53))
-                    if database:
-                        save_cache(database)
-                except (OSError, DNSError):
-
-                    print("can not ask server " + forward_server + " time: " + str(datetime.now()))
-    except:
-        print('server error')
-
-
+# Основной цикл
 def main():
-    print('server started')
+    print("Starting DNS Server")
+    print("Loading cache from disk...")
+    global cache
+    cache = load_cache_from_disk(CACHE_FILE_NAME)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(("localhost", 53))
+    while True:
+        data_in_socket, _, _ = select([sock], [], [], 1)
+        if not data_in_socket:
+            continue
+        conn, addr = sock.recvfrom(2048)
+        clear_old_cache(cache)
+        try:
+            dns_record = DNSRecord.parse(conn)
+        except DNSError:
+            print("Can't parse DNS record")
+            continue
+        cache_records(dns_record, cache)
+        if not dns_record.header.qr:
+            response = find_record_in_cache(dns_record, cache)
+            if response:
+                response = response.pack()
+            else:
+                try:
+                    response = dns_record.send(forward_server)
+                    cache_records(DNSRecord.parse(response), cache)
+                except (OSError, DNSError):
+                    print("Server " + forward_server + "unavailable")
+            sock.sendto(response, addr)
+        save_cache_to_disk(cache, CACHE_FILE_NAME)
 
-    global database
 
-    database = load_cache()
-
-    try:
-        work_loop()
-    finally:
-        if database:
-            save_cache(database)
-        print('server stop')
+def stop(signal, frame):
+    clear_old_cache(cache)
+    save_cache_to_disk(cache, CACHE_FILE_NAME)
+    print('Server stoped')
+    sys.exit(0)
 
 
 if __name__ == '__main__':
+    signal.signal(signal.SIGINT, stop)
     main()
